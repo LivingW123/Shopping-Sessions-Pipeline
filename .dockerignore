@@ -1,0 +1,12 @@
+target/
+data/
+dev/
+out/
+out-*/
+dev-answer/
+starter-*/
+generator/
+fixtures/
+scripts/
+.git
+.github/

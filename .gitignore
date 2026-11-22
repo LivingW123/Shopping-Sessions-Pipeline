@@ -1,0 +1,39 @@
+# Build outputs
+/target/
+generator/**/target/
+
+# Datasets and run outputs (never commit data; repo must stay small)
+/data/
+/dev/
+/out/
+/out-*/
+*.parquet
+
+# Downloaded reference material (kept locally, not part of the submission)
+/dev-answer/
+/starter-duckdb/
+/starter-polars/
+/starter-pyspark/
+
+# Python / editor / OS cruft
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# Downloaded archives (starters, generator, dev answer)
+*.zip
+
+# Profiling output
+perf.data*
+*.svg
+flamegraph*
+*.prof
+
+# Local secrets / env
+.env
+.env.*

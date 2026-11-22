@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.parquet binary
+# fixtures hold deliberate CR bytes (E20); never normalize them
+fixtures/** -text
