@@ -1118,7 +1118,7 @@ fn main() {
             for t in &p2 {
                 for sl in t.slices(b) {
                 for (j, r) in sl.iter().enumerate() {
-                    if let Some(nx) = sl.get(j + 8) {
+                    if let Some(nx) = sl.get(j + 48) {
                         dtab.prefetch(nx.h1);
                     }
                     let (ming, tie) = dtab.get(r.h1);
