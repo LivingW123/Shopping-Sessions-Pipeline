@@ -239,7 +239,11 @@ pub fn write(path: &std::path::Path, cols: &[(&str, Col)]) -> std::io::Result<()
     out.extend_from_slice(&m.b);
     out.extend_from_slice(&(m.b.len() as u32).to_le_bytes());
     out.extend_from_slice(b"PAR1");
+    let t = std::time::Instant::now();
     let mut f = std::fs::File::create(path)?;
     f.write_all(&out)?;
+    if std::env::var("PIPE_VERBOSE").is_ok() {
+        eprintln!("    wrote {} ({} MB) in {:.3}s", path.display(), out.len() >> 20, t.elapsed().as_secs_f64());
+    }
     Ok(())
 }

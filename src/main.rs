@@ -1246,6 +1246,7 @@ fn main() {
         .unwrap();
     }
     // user_daily: one file per worker
+    lap("campaign_daily written");
     let nonempty: Vec<&P3> = p3.iter().filter(|t| !t.rows.is_empty()).collect();
     let write_ud = |i: usize, rows: &[UserRow]| {
         let names: Vec<&[u8]> = rows.iter().map(|r| files.get(r.name)).collect();
