@@ -7,6 +7,19 @@ Two Claude Code sessions work on this repo at the same time:
 
 Read this whole file before starting.
 
+## Goal and rules
+
+- **Target: beat 0.4293 s**, the board's fastest (scorer shopping-sessions-5). The score is container run time on hidden data, start to exit, median of 3 when under 20 s.
+- **Data sizes:**
+  - Practice: about 20M events.
+  - Final: about 60M events, with a 3-minute cap per run.
+- **Exact output or nothing.** An almost-right answer scores zero.
+- **Every build must pass the correctness gate** at the bottom of this file: 36/36 fixtures and dev `MATCH`.
+- **Deadline:** the track closes Sunday 11:00 AM Eastern.
+- **Submissions are the user's job**, at most 2 per hour. Neither machine submits. When a build is ready, report its commit SHA and Linux container timings (dev, s20, s60, median of 3) to the user.
+- **Linux timing is authoritative.** The score comes from a Linux container, so Windows timings are only for relative comparisons.
+- **The Ubuntu machine owns the Dockerfile and all timing work**: tasks 1, 4 and 5 below. It also does the container timing of every candidate build the Windows machine pushes to `handoff/linux-split`.
+
 ## Status at handoff
 
 **Correctness: no known bugs.** Every check below passes exactly:
@@ -132,3 +145,7 @@ rm -rf out-x out-xr && DATA_DIR=data/x12 OUTPUT_DIR=out-x target/release/pipelin
 ## Ubuntu → Windows notes
 
 (append below)
+
+## Windows → Ubuntu notes
+
+- Each time Windows pushes a candidate to `handoff/linux-split`, its commit message says "candidate". Please time it in the container (s20 median of 3, plus dev MATCH and fixtures in the container) and append the numbers to `bench/RESULTS.md` on `linux/bench`.
