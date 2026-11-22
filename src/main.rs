@@ -346,6 +346,75 @@ impl U64Map {
     }
 }
 
+/// Small growable map u64 -> dense id (insertion order).
+struct LMap {
+    slots: Vec<Slot>,
+    mask: usize,
+    n: usize,
+}
+
+impl LMap {
+    fn new() -> Self {
+        LMap { slots: Vec::new(), mask: 0, n: 0 }
+    }
+    fn reset(&mut self, hint: usize) {
+        let cap = (hint * 2).next_power_of_two().max(64);
+        self.slots.clear();
+        self.slots.resize(cap, Slot { k: 0, v: u32::MAX });
+        self.mask = cap - 1;
+        self.n = 0;
+    }
+    #[inline(always)]
+    fn idx(&self, k: u64) -> usize {
+        (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & self.mask
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> u32 {
+        let mut i = self.idx(k);
+        loop {
+            let s = self.slots[i];
+            if s.v == u32::MAX || s.k == k {
+                return s.v;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn get_or_insert(&mut self, k: u64) -> (u32, bool) {
+        if self.n * 2 >= self.slots.len() {
+            self.grow();
+        }
+        let mut i = self.idx(k);
+        loop {
+            let s = self.slots[i];
+            if s.v == u32::MAX {
+                self.slots[i] = Slot { k, v: self.n as u32 };
+                self.n += 1;
+                return (self.n as u32 - 1, true);
+            }
+            if s.k == k {
+                return (s.v, false);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    fn grow(&mut self) {
+        let old = std::mem::take(&mut self.slots);
+        let cap = (old.len() * 2).max(64);
+        self.slots = vec![Slot { k: 0, v: u32::MAX }; cap];
+        self.mask = cap - 1;
+        for s in old {
+            if s.v != u32::MAX {
+                let mut i = self.idx(s.k);
+                while self.slots[i].v != u32::MAX {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = s;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- records
 
 #[derive(Clone, Copy)]
@@ -850,31 +919,129 @@ fn main() {
         stats: Vec<CStat>,
         evs: Vec<SRec>,
         cks: Vec<CRec>,
+        tm: [u128; 4],
+        lmap: LMap,
+        lids: Vec<u32>,
+        cnt: Vec<u32>,
+        eoff: Vec<u32>,
+        clid: Vec<u32>,
+        ccnt: Vec<u32>,
+        coff: Vec<u32>,
     }
     let p3: Vec<P3> = run_par(
         threads,
         NPB,
-        || P3 { rows: Vec::new(), stats: vec![CStat::default(); ncamp * ndays], evs: Vec::new(), cks: Vec::new() },
+        || P3 { rows: Vec::new(), stats: vec![CStat::default(); ncamp * ndays], evs: Vec::new(),
+            cks: Vec::new(),
+            tm: [0; 4],
+            lmap: LMap::new(),
+            lids: Vec::new(),
+            cnt: Vec::new(),
+            eoff: Vec::new(),
+            clid: Vec::new(),
+            ccnt: Vec::new(),
+            coff: Vec::new(),
+        },
         |st, b| {
             let n: usize = p2.iter().map(|t| t[b].len()).sum();
             if n == 0 {
                 return;
             }
+            let t0 = std::time::Instant::now();
+            // dense local person ids, then counting sort by person
+            let lm = &mut st.lmap;
+            lm.reset(n / 8 + 16);
+            let lids = &mut st.lids;
+            lids.clear();
+            let cnt = &mut st.cnt;
+            cnt.clear();
+            for t in &p2 {
+                for r in &t[b] {
+                    let (l, ins) = lm.get_or_insert(r.ukey);
+                    if ins {
+                        cnt.push(0);
+                    }
+                    cnt[l as usize] += 1;
+                    lids.push(l);
+                }
+            }
+            let m = cnt.len();
+            let eoff = &mut st.eoff;
+            eoff.clear();
+            eoff.push(0);
+            let mut acc = 0u32;
+            for c in cnt.iter_mut() {
+                acc += *c;
+                eoff.push(acc);
+                *c = acc - *c; // write cursor
+            }
             let evs = &mut st.evs;
             evs.clear();
+            evs.resize(n, SRec { ukey: 0, uloc: 0, ts: 0, price: 0, cat: 0, etype: 0 });
+            let mut k = 0;
             for t in &p2 {
-                evs.extend_from_slice(&t[b]);
+                for r in &t[b] {
+                    let l = lids[k] as usize;
+                    k += 1;
+                    evs[cnt[l] as usize] = *r;
+                    cnt[l] += 1;
+                }
             }
+            // clicks of persons that have events
+            let cl = &mut st.clid;
+            cl.clear();
+            let ccnt = &mut st.ccnt;
+            ccnt.clear();
+            ccnt.resize(m, 0);
+            for t in &p1ck {
+                for r in &t[b] {
+                    let l = lm.get(r.ukey);
+                    if l != u32::MAX {
+                        ccnt[l as usize] += 1;
+                    }
+                    cl.push(l);
+                }
+            }
+            let coff = &mut st.coff;
+            coff.clear();
+            coff.push(0);
+            let mut acc = 0u32;
+            for c in ccnt.iter_mut() {
+                acc += *c;
+                coff.push(acc);
+                *c = acc - *c;
+            }
+            let nc = acc as usize;
             let cks = &mut st.cks;
             cks.clear();
+            cks.resize(nc, CRec { ukey: 0, ts: 0, cloc: 0, camp: 0 });
+            let mut k = 0;
             for t in &p1ck {
-                cks.extend_from_slice(&t[b]);
+                for r in &t[b] {
+                    let l = cl[k];
+                    k += 1;
+                    if l != u32::MAX {
+                        cks[ccnt[l as usize] as usize] = *r;
+                        ccnt[l as usize] += 1;
+                    }
+                }
             }
-            evs.sort_unstable_by_key(|r| (r.ukey, r.ts));
-            cks.sort_unstable_by(|a, b| {
-                (a.ukey, a.ts).cmp(&(b.ukey, b.ts)).then_with(|| files.get(a.cloc).cmp(files.get(b.cloc)))
-            });
-            process_bucket(&st.evs, &st.cks, &mut st.rows, &mut st.stats, &Ctx {
+            let t1 = std::time::Instant::now();
+            for l in 0..m {
+                let g = &mut evs[eoff[l] as usize..eoff[l + 1] as usize];
+                if g.len() > 1 {
+                    g.sort_unstable_by_key(|r| r.ts);
+                }
+            }
+            let t2 = std::time::Instant::now();
+            for l in 0..m {
+                let g = &mut cks[coff[l] as usize..coff[l + 1] as usize];
+                if g.len() > 1 {
+                    g.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| files.get(a.cloc).cmp(files.get(b.cloc))));
+                }
+            }
+            let t3 = std::time::Instant::now();
+            process_bucket(&st.evs, &st.eoff, &st.cks, &st.coff, &mut st.rows, &mut st.stats, &Ctx {
                 ws_day,
                 ndays,
                 ncat,
@@ -882,9 +1049,19 @@ fn main() {
                 organic,
                 person_name: &person_name,
             });
+            let t4 = std::time::Instant::now();
+            st.tm[0] += (t1 - t0).as_nanos();
+            st.tm[1] += (t2 - t1).as_nanos();
+            st.tm[2] += (t3 - t2).as_nanos();
+            st.tm[3] += (t4 - t3).as_nanos();
         },
     );
     drop(p2);
+    if verbose {
+        let mut tm = [0u128; 4];
+        for t in &p3 { for k in 0..4 { tm[k] += t.tm[k]; } }
+        eprintln!("  phase3 thread-ms: gather {} sortE {} sortC {} process {}", tm[0] / 1_000_000, tm[1] / 1_000_000, tm[2] / 1_000_000, tm[3] / 1_000_000);
+    }
     lap("sessionized");
 
     // ---------------- outputs
@@ -987,7 +1164,15 @@ struct Sess {
     purch: bool,
 }
 
-fn process_bucket(evs: &[SRec], cks: &[CRec], rows: &mut Vec<UserRow>, stats: &mut [CStat], ctx: &Ctx) {
+fn process_bucket(
+    evs: &[SRec],
+    eoff: &[u32],
+    cks: &[CRec],
+    coff: &[u32],
+    rows: &mut Vec<UserRow>,
+    stats: &mut [CStat],
+    ctx: &Ctx,
+) {
     let ndays = ctx.ndays;
     let mut sessions: Vec<Sess> = Vec::new();
     let mut starts: Vec<i64> = Vec::new();
@@ -995,23 +1180,10 @@ fn process_bucket(evs: &[SRec], cks: &[CRec], rows: &mut Vec<UserRow>, stats: &m
     let mut cat_rev: Vec<u64> = vec![0; ctx.ncat];
     let mut touched: Vec<u16> = Vec::new();
     let mut by_camp: Vec<(u32, i64)> = Vec::new();
-    let mut ci = 0usize;
-    let mut i = 0usize;
-    while i < evs.len() {
-        let key = evs[i].ukey;
-        let mut j = i + 1;
-        while j < evs.len() && evs[j].ukey == key {
-            j += 1;
-        }
-        while ci < cks.len() && cks[ci].ukey < key {
-            ci += 1;
-        }
-        let cs = ci;
-        while ci < cks.len() && cks[ci].ukey == key {
-            ci += 1;
-        }
-        let pe = &evs[i..j];
-        let pc = &cks[cs..ci];
+    for l in 0..eoff.len() - 1 {
+        let pe = &evs[eoff[l] as usize..eoff[l + 1] as usize];
+        let pc = &cks[coff[l] as usize..coff[l + 1] as usize];
+        let key = pe[0].ukey;
         let name = if key & LINKED != 0 { ctx.person_name[(key & !LINKED) as usize] } else { pe[0].uloc };
 
         // sessionize + user_daily
@@ -1139,6 +1311,5 @@ fn process_bucket(evs: &[SRec], cks: &[CRec], rows: &mut Vec<UserRow>, stats: &m
                 add(camp, a, b);
             }
         }
-        i = j;
     }
 }

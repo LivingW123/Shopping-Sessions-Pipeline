@@ -25,7 +25,8 @@ jobs:
         run: |
           pip install -q polars
           chmod +x scripts/docker_run.sh
-          CPUS=4 MEM=14g python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh 2>&1 | tail -3
+          CPUS=4 MEM=14g python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh > /tmp/fx.txt 2>&1 || true
+          tail -3 /tmp/fx.txt; echo "::notice title=fixtures::$(tail -1 /tmp/fx.txt)"
 
       - name: Generate datasets
         run: |
@@ -36,6 +37,7 @@ jobs:
 
       - name: Time runs (container, scorer flags, 4 CPUs)
         run: |
+          note() { msg=$(awk 'BEGIN{ORS="%0A"} {gsub(/%/,"%25"); gsub(//,""); print}' "$2"); echo "::notice title=$1::$msg"; }
           run() {
             rm -rf /tmp/out && mkdir -p /tmp/out /tmp/scr && chmod 777 /tmp/out /tmp/scr
             /usr/bin/time -f "$1 wall %e s  maxrss %M KB" docker run --rm --network none --read-only \
@@ -43,8 +45,10 @@ jobs:
               --cpus 4 --memory 14g --memory-swap 14g --user 1000:1000 \
               -v "$2":/data:ro -v /tmp/out:/output -v /tmp/scr:/scratch \
               -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-              -e NCPU=${3:-4} -e MEM_GB=14 -e PIPE_VERBOSE=1 shopping-sessions:latest
+              -e NCPU=${3:-4} -e MEM_GB=14 -e PIPE_VERBOSE=1 shopping-sessions:latest > /tmp/log.txt 2>&1
+            cat /tmp/log.txt; note "$1" /tmp/log.txt
           }
+          lscpu | grep -E "Model name|^CPU\(s\)|Thread" > /tmp/cpu.txt; note cpu /tmp/cpu.txt
           run dev /tmp/dev
           cat /tmp/s20/events/* > /dev/null
           for i in 1 2 3; do run s20 /tmp/s20; done
