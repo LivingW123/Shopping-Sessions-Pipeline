@@ -250,11 +250,19 @@ pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
         return Some(if b[19] == b'+' { base - off } else { base + off });
     }
     if n <= 16 {
-        // F3 fast path: right-align into 16 ASCII digits, SWAR-validate and convert
-        let mut buf = [b'0'; 16];
-        buf[16 - n..].copy_from_slice(b);
-        let hi = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let lo = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        // F3 fast path: two overlapping 8-byte loads, left-padded with '0'
+        // digits, SWAR-validated and converted (no memcpy)
+        if n < 8 {
+            return parse_ts(b);
+        }
+        let k = n - 8; // leading digits beyond the last 8
+        let lo = u64::from_le_bytes(b[k..n].try_into().unwrap());
+        let hi = if k == 0 {
+            0x3030_3030_3030_3030
+        } else {
+            let w = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            (w << (8 * (8 - k))) | 0x3030_3030_3030_3030u64.checked_shr(8 * k as u32).unwrap_or(0)
+        };
         if !swar_digits(hi) || !swar_digits(lo) {
             return None;
         }
