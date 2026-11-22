@@ -475,17 +475,104 @@ impl LMap {
 
 // ---------------------------------------------------------------- records
 
+/// Parsed event awaiting its batch flush.
 #[derive(Clone, Copy)]
-struct EvRec {
+struct PRec {
     h1: u64,
-    eloc: u64,
-    ukey: u64, // user hash until resolved to a person key
+    ukey: u64, // user hash, resolved to a person key at flush
     uloc: u64,
-    ts: u32,     // ms since window_start
-    ingest: u32, // epoch seconds
-    price: u32,
-    cat: u16,
-    etype: u8, // 0 = invalid, 1 view, 2 cart, 3 purchase
+    pk: u64,
+    ing: u32,
+    valid: bool,
+}
+
+/// Global lock-free table: event-id hash -> minimum ingest over all parsed
+/// copies. Slot = fingerprint(39) | tie(1) | ingest(24); 0 = empty.
+struct DTab {
+    s: Vec<AtomicU64>,
+    cap: usize,
+}
+
+impl DTab {
+    const ING_MAX: u32 = (1 << 24) - 1;
+    fn new(n: usize) -> Self {
+        let cap = n.max(1024);
+        // zeroed allocation (fresh mmap pages for large sizes); AtomicU64 has u64's layout
+        let v: Vec<u64> = vec![0u64; cap];
+        let mut v = std::mem::ManuallyDrop::new(v);
+        let s = unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU64, v.len(), v.capacity()) };
+        DTab { s, cap }
+    }
+    #[inline(always)]
+    fn idx(&self, h: u64) -> usize {
+        ((h as u128 * self.cap as u128) >> 64) as usize
+    }
+    #[inline(always)]
+    fn fp(h: u64) -> u64 {
+        (h & ((1u64 << 39) - 1)) | 1
+    }
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.s.as_ptr().add(self.idx(h)) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[inline]
+    fn insert_min(&self, h: u64, ing: u32) {
+        let fp = Self::fp(h);
+        let ing = ing as u64;
+        let mut i = self.idx(h);
+        loop {
+            let mut cur = self.s[i].load(Ordering::Relaxed);
+            if cur == 0 {
+                match self.s[i].compare_exchange(0, (fp << 25) | ing, Ordering::AcqRel, Ordering::Relaxed) {
+                    Ok(_) => return,
+                    Err(x) => cur = x,
+                }
+            }
+            if cur >> 25 == fp {
+                loop {
+                    let cing = cur & 0xff_ffff;
+                    let new = if ing < cing {
+                        (fp << 25) | ing
+                    } else if ing == cing {
+                        cur | (1 << 24)
+                    } else {
+                        return;
+                    };
+                    if new == cur {
+                        return;
+                    }
+                    match self.s[i].compare_exchange(cur, new, Ordering::AcqRel, Ordering::Relaxed) {
+                        Ok(_) => return,
+                        Err(x) => cur = x,
+                    }
+                }
+            }
+            i += 1;
+            if i == self.cap {
+                i = 0;
+            }
+        }
+    }
+    /// (minimum ingest, tie) for an inserted id.
+    #[inline]
+    fn get(&self, h: u64) -> (u32, bool) {
+        let fp = Self::fp(h);
+        let mut i = self.idx(h);
+        loop {
+            let cur = self.s[i].load(Ordering::Relaxed);
+            if cur >> 25 == fp || cur == 0 {
+                return ((cur & 0xff_ffff) as u32, cur & (1 << 24) != 0);
+            }
+            i += 1;
+            if i == self.cap {
+                i = 0;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -493,6 +580,8 @@ struct SRec {
     ukey: u64,
     uloc: u64,
     pk: u64, // ts_rel << 33 | etype << 31 | price << 7 | cat
+    h1: u64, // event-id hash
+    ing: u32,
 }
 
 #[inline(always)]
@@ -838,31 +927,30 @@ fn main() {
     let ec_chunks: Vec<&Chunk> = chunks.iter().filter(|c| c.kind != Kind::Link).collect();
     const BATCH: usize = 64;
     struct P1 {
-        ev: Blocks<EvRec>,
+        ev: Blocks<SRec>,
         ck: Blocks<CRec>,
         pos: Scan,
         dc: DateCache,
-        pev: Vec<EvRec>,
+        pev: Vec<PRec>,
         pck: Vec<CRec>,
     }
-    // bucket sizing from input volume: ~12k events per event-id bucket keeps
-    // the dedup table and its records in L2
     let ev_bytes: usize = (0..kinds.len()).filter(|&i| kinds[i] == Kind::Event).map(|i| files.data(i).len()).sum();
     let ck_bytes: usize = (0..kinds.len()).filter(|&i| kinds[i] == Kind::Click).map(|i| files.data(i).len()).sum();
     let est_ev = ev_bytes / 95 + 1;
     let est_ck = ck_bytes / 55 + 1;
-    let eb_bits: u32 = ((est_ev / 12_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 14);
-    let neb = 1usize << eb_bits;
     // block ~ half of a thread's share of one bucket, so partial tail blocks waste little
-    let ev_blk = (est_ev / neb / threads / 2).clamp(16, 1024);
     let ck_blk = (est_ck / NPB / threads / 2).clamp(16, 1024);
     let sr_blk = (est_ev / NPB / threads / 2).clamp(16, 1024);
-    let flush_ev = |st_ev: &mut Blocks<EvRec>, pev: &mut Vec<EvRec>| {
-        for r in pev.iter_mut() {
-            if r.etype != 0 {
-                r.ukey = resolve_h(r.ukey);
+    // global event-id table: min ingest per event id (dedup before validation)
+    let dtab = DTab::new(est_ev + est_ev / 2 + 1024);
+    let ing_base = ws.div_euclid(1000) - 30 * 86_400;
+    let flush_ev = |st_ev: &mut Blocks<SRec>, pev: &mut Vec<PRec>| {
+        for r in pev.iter() {
+            dtab.insert_min(r.h1, r.ing);
+            if r.valid {
+                let ukey = resolve_h(r.ukey);
+                st_ev.push(pbucket(ukey), SRec { ukey, uloc: r.uloc, pk: r.pk, h1: r.h1, ing: r.ing });
             }
-            st_ev.push((r.h1 >> (64 - eb_bits)) as usize, *r);
         }
         pev.clear();
     };
@@ -877,7 +965,7 @@ fn main() {
         threads,
         ec_chunks.len(),
         || P1 {
-            ev: Blocks::new(neb, ev_blk),
+            ev: Blocks::new(NPB, sr_blk),
             ck: Blocks::new(NPB, ck_blk),
             pos: Scan::new(),
             dc: DateCache::new(),
@@ -894,23 +982,14 @@ fn main() {
                         return;
                     }
                     let h1 = hash64(f[0], SEED_E1);
+                    dtab.prefetch(h1);
                     let ingest_ms = parse_ts_c(f[3], dc).unwrap_or(i64::MAX);
-                    let ingest = if ingest_ms == i64::MAX {
-                        u32::MAX
+                    let ing = if ingest_ms == i64::MAX {
+                        DTab::ING_MAX
                     } else {
-                        (ingest_ms / 1000).clamp(0, u32::MAX as i64 - 1) as u32
+                        (ingest_ms.div_euclid(1000) - ing_base).clamp(0, DTab::ING_MAX as i64) as u32
                     };
-                    let mut r = EvRec {
-                        h1,
-                        eloc: pack_loc(c.file, d, f[0]),
-                        ukey: 0,
-                        uloc: 0,
-                        ts: 0,
-                        ingest,
-                        price: 0,
-                        cat: 0,
-                        etype: 0,
-                    };
+                    let mut r = PRec { h1, ukey: 0, uloc: 0, pk: 0, ing, valid: false };
                     'v: {
                         if f[1].is_empty() || f[5].is_empty() {
                             break 'v;
@@ -928,22 +1007,24 @@ fn main() {
                         if ingest_ms == i64::MAX || ingest_ms - ts > DAY_MS {
                             break 'v;
                         }
+                        let mut price = 0;
+                        let mut cat = 0;
                         if et == 3 {
                             match parse_price(f[6]) {
-                                Some(p) => r.price = p,
+                                Some(p) => price = p,
                                 None => break 'v,
                             }
-                            r.cat = match prod_tab.get(hash64(f[5], SEED_P)) {
+                            cat = match prod_tab.get(hash64(f[5], SEED_P)) {
                                 Some(pi) if prod_names[pi as usize] == f[5] => prod_cat[pi as usize],
                                 _ => unknown_cat,
                             };
                         }
-                        r.ts = (ts - ws) as u32;
+                        r.pk = pack_ev((ts - ws) as u32, et, price, cat);
                         let h = hash64(f[1], SEED_U);
                         link_table.prefetch(h);
                         r.ukey = h;
                         r.uloc = pack_loc(c.file, d, f[1]);
-                        r.etype = et;
+                        r.valid = true;
                     }
                     pev.push(r);
                     if pev.len() == BATCH {
@@ -976,97 +1057,12 @@ fn main() {
         },
     );
     lap("parsed");
-
-    // ---------------- dedup events per event-id bucket
-    let p1ev: Vec<&Blocks<EvRec>> = p1.iter().map(|x| &x.ev).collect();
-    #[derive(Clone, Copy)]
-    struct DSlot {
-        h1: u64,
-        ingest: u32,
-        r: u32, // (thread << 24) | index, u32::MAX = empty
+    let mut p2: Vec<Blocks<SRec>> = Vec::new();
+    let mut p1ck: Vec<Blocks<CRec>> = Vec::new();
+    for x in p1 {
+        p2.push(x.ev);
+        p1ck.push(x.ck);
     }
-    struct P2 {
-        out: Blocks<SRec>,
-        tab: Vec<DSlot>,
-        win: Vec<u64>,
-    }
-    let p2: Vec<P2> = run_par(
-        threads,
-        neb,
-        || P2 { out: Blocks::new(NPB, sr_blk), tab: Vec::new(), win: Vec::new() },
-        |st, b| {
-            let mut offs = [0usize; 257];
-            let nt = p1ev.len();
-            for t in 0..nt {
-                offs[t + 1] = offs[t] + p1ev[t].len(b);
-            }
-            let n = offs[nt];
-            if n == 0 {
-                return;
-            }
-            let rec = |g: usize| -> &EvRec {
-                let mut t = 0;
-                while offs[t + 1] <= g {
-                    t += 1;
-                }
-                p1ev[t].get(b, g - offs[t])
-            };
-            let cap = (n * 2).next_power_of_two();
-            let mask = cap - 1;
-            let tab = &mut st.tab;
-            tab.clear();
-            tab.resize(cap, DSlot { h1: 0, ingest: 0, r: u32::MAX });
-            let mut g = 0u32;
-            for src in p1ev.iter() {
-                for sl in src.slices(b) {
-                    for r in sl {
-                        let mut s = ((r.h1 >> 20) as usize) & mask;
-                        loop {
-                            let x = tab[s];
-                            if x.r == u32::MAX {
-                                tab[s] = DSlot { h1: r.h1, ingest: r.ingest, r: g };
-                                break;
-                            }
-                            if x.h1 == r.h1 && files.get(rec(x.r as usize).eloc) == files.get(r.eloc) {
-                                if r.ingest < x.ingest {
-                                    tab[s] = DSlot { h1: r.h1, ingest: r.ingest, r: g };
-                                }
-                                break;
-                            }
-                            s = (s + 1) & mask;
-                        }
-                        g += 1;
-                    }
-                }
-            }
-            let win = &mut st.win;
-            win.clear();
-            win.resize(n.div_ceil(64), 0);
-            for x in tab.iter() {
-                if x.r != u32::MAX {
-                    win[(x.r >> 6) as usize] |= 1u64 << (x.r & 63);
-                }
-            }
-            let out = &mut st.out;
-            let mut g = 0usize;
-            for src in p1ev.iter() {
-                for sl in src.slices(b) {
-                    for r in sl {
-                        if r.etype != 0 && (win[g >> 6] >> (g & 63)) & 1 != 0 {
-                            out.push(
-                                pbucket(r.ukey),
-                                SRec { ukey: r.ukey, uloc: r.uloc, pk: pack_ev(r.ts, r.etype, r.price, r.cat) },
-                            );
-                        }
-                        g += 1;
-                    }
-                }
-            }
-        },
-    );
-    drop(p1ev);
-    let p2: Vec<Blocks<SRec>> = p2.into_iter().map(|x| x.out).collect();
-    let p1ck: Vec<Blocks<CRec>> = p1.into_iter().map(|x| x.ck).collect();
     lap("deduped");
 
     // ---------------- per person bucket
@@ -1075,6 +1071,7 @@ fn main() {
         stats: Vec<CStat>,
         evs: Vec<u64>,
         names: Vec<u64>,
+        seen: std::collections::HashSet<u64>,
         cks: Vec<CRec>,
         tm: [u128; 4],
         lmap: LMap,
@@ -1090,6 +1087,7 @@ fn main() {
         NPB,
         || P3 { rows: Vec::new(), stats: vec![CStat::default(); ncamp * ndays], evs: Vec::new(),
             names: Vec::new(),
+            seen: std::collections::HashSet::new(),
             cks: Vec::new(),
             tm: [0; 4],
             lmap: LMap::new(),
@@ -1115,8 +1113,19 @@ fn main() {
             cnt.clear();
             let names = &mut st.names;
             names.clear();
+            let seen = &mut st.seen;
+            seen.clear();
             for t in &p2 {
-                for r in t.iter(b) {
+                for sl in t.slices(b) {
+                for (j, r) in sl.iter().enumerate() {
+                    if let Some(nx) = sl.get(j + 8) {
+                        dtab.prefetch(nx.h1);
+                    }
+                    let (ming, tie) = dtab.get(r.h1);
+                    if r.ing != ming || (tie && !seen.insert(r.h1)) {
+                        lids.push(u32::MAX);
+                        continue;
+                    }
                     let (l, ins) = lm.get_or_insert(r.ukey);
                     if ins {
                         cnt.push(0);
@@ -1124,6 +1133,7 @@ fn main() {
                     }
                     cnt[l as usize] += 1;
                     lids.push(l);
+                }
                 }
             }
             let m = cnt.len();
@@ -1142,10 +1152,12 @@ fn main() {
             let mut k = 0;
             for t in &p2 {
                 for r in t.iter(b) {
-                    let l = lids[k] as usize;
+                    let l = lids[k];
                     k += 1;
-                    evs[cnt[l] as usize] = r.pk;
-                    cnt[l] += 1;
+                    if l != u32::MAX {
+                        evs[cnt[l as usize] as usize] = r.pk;
+                        cnt[l as usize] += 1;
+                    }
                 }
             }
             // clicks of persons that have events

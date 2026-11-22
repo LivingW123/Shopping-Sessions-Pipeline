@@ -37,6 +37,16 @@ unsafe impl GlobalAlloc for Alloc {
         System.alloc(l)
     }
     #[inline]
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        #[cfg(target_os = "linux")]
+        {
+            if l.size() >= BIG && l.align() <= HUGE {
+                return self.alloc(l); // fresh anonymous mmap pages are already zero
+            }
+        }
+        System.alloc_zeroed(l)
+    }
+    #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         #[cfg(target_os = "linux")]
         {
