@@ -209,16 +209,27 @@ fn parse_datetime19_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
         dc.days[slot] = days;
         days
     };
-    if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b[10] != b'T' {
         return None;
     }
-    let h = d2(b, 11)?;
-    let mi = d2(b, 14)?;
-    let s = d2(b, 17)?;
+    // "HH:MM:SS" in one 8-byte load: xor with the "00:00:00" template leaves
+    // digit values in digit bytes and zero in colon bytes when well-formed.
+    let w = u64::from_le_bytes(b[11..19].try_into().unwrap());
+    let x = w ^ 0x3030_3a30_303a_3030;
+    if (x & 0xF0F0_F0F0_F0F0_F0F0) != 0
+        || (x.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) != 0
+        || (x & 0x0000_FF00_00FF_0000) != 0
+    {
+        return None;
+    }
+    let byte = |i: u32| ((x >> (8 * i)) & 0xff) as i64;
+    let h = byte(0) * 10 + byte(1);
+    let mi = byte(3) * 10 + byte(4);
+    let s = byte(6) * 10 + byte(7);
     if h > 23 || mi > 59 || s > 59 {
         return None;
     }
-    Some(((days * 86_400) + (h as i64) * 3600 + (mi as i64) * 60 + s as i64) * 1000)
+    Some(((days * 86_400) + h * 3600 + mi * 60 + s) * 1000)
 }
 
 /// `parse_ts` with a date cache.
@@ -379,6 +390,8 @@ mod tests {
         for t in [&b"2026-10-03T23:58:10Z"[..], b"2026-10-03T19:58:10-04:00", b"2026-02-29T00:00:00Z", b"2028-02-29T00:00:00Z",
                   b"2026-10-03T24:00:00Z", b"2026-10-03 23:58:10Z", b"2026-13-03T23:58:10Z", b"2026-10-03T23:58:10z", b"1791071890000",
                   b"2026-10-03T23:58:10+24:00", b"2026-10-03T23:58:10+05:60", b"2026-10-03T23:58:10-00:00",
+                  b"2026-10-03T23:58:1aZ", b"2026-10-03T23:5:10Z0", b"2026-10-03T2::58:10Z", b"2026-10-03T23;58:10Z", b"2026-10-03T23:58:60Z",
+                  b"2026-10-03T19:59:59+23:59", b"2026-10-03T00:00:00Z", b"2026-10-03T23:59:59Z", b"2026-10-03T23:58:10+05:30",
                   b"0", b"7", b"0001791071890000", b"1791071890000", b"9999999999999999", b"12345678", b"1234567x", b"1791071890000.0",
                   b"\xd9\xa2\xd9\xa5", b"86400000", b"/0000000", b":0000000", b"00000000000000000000001791071890000"] {
             for _ in 0..2 {

@@ -253,6 +253,38 @@ fn for_records<'a, const N: usize>(
         let mut idx = 0usize;
         let mut ls = 0usize;
         while idx < sep.len() {
+            // fast path: the next N separators are N-1 commas and a line end
+            if idx + N <= sep.len() {
+                let mut ends = [0usize; N];
+                let mut ok = true;
+                for (k, e) in ends.iter_mut().enumerate() {
+                    let p = unsafe { *sep.get_unchecked(idx + k) } as usize;
+                    *e = p;
+                    let c = if p < slen { unsafe { *seg.get_unchecked(p) } } else { b'\n' };
+                    ok &= c == if k + 1 < N { b',' } else { b'\n' };
+                }
+                if ok {
+                    let mut qsum = 0usize;
+                    let mut a = ls;
+                    for k in 0..N {
+                        let b = ends[k];
+                        // branchless: strip quotes when the field is "..." (len >= 2)
+                        let x = unsafe { *seg.get_unchecked(a.min(slen - 1)) };
+                        let y = unsafe { *seg.get_unchecked(b.saturating_sub(1)) };
+                        let q = ((b >= a + 2) & (x == b'"') & (y == b'"')) as usize;
+                        qsum += 2 * q;
+                        fields[k] = unsafe { seg.get_unchecked(a + q..b - q) };
+                        a = b + 1;
+                    }
+                    let le = ends[N - 1];
+                    if popcnt_range(qbits, ls, le.min(slen)) as usize == qsum {
+                        f(&fields);
+                    }
+                    ls = le + 1;
+                    idx += N;
+                    continue;
+                }
+            }
             let mut k = 0usize;
             let mut fs = ls;
             let mut qsum = 0u32;
