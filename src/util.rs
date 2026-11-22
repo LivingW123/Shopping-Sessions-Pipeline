@@ -217,7 +217,33 @@ pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
         let off = ((oh as i64) * 60 + om as i64) * 60_000;
         return Some(if b[19] == b'+' { base - off } else { base + off });
     }
+    if n <= 16 {
+        // F3 fast path: right-align into 16 ASCII digits, SWAR-validate and convert
+        let mut buf = [b'0'; 16];
+        buf[16 - n..].copy_from_slice(b);
+        let hi = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let lo = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        if !swar_digits(hi) || !swar_digits(lo) {
+            return None;
+        }
+        return Some((swar8(hi) * 100_000_000 + swar8(lo)) as i64);
+    }
     parse_ts(b)
+}
+
+#[inline(always)]
+fn swar_digits(x: u64) -> bool {
+    (x & 0xF0F0_F0F0_F0F0_F0F0) | (((x.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0) >> 4)
+        == 0x3333_3333_3333_3333
+}
+
+/// 8 ASCII digits (first digit at the lowest address) -> value.
+#[inline(always)]
+fn swar8(x: u64) -> u64 {
+    let mut v = x.wrapping_sub(0x3030_3030_3030_3030);
+    v = (v.wrapping_mul(10) + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v.wrapping_mul(100) + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (v.wrapping_mul(10000) + (v >> 32)) & 0x0000_0000_FFFF_FFFF
 }
 
 /// Parses an event/click `ts` (F1, F2 or F3). Returns None for a bad
@@ -312,7 +338,9 @@ mod tests {
         let mut dc = DateCache::new();
         for t in [&b"2026-10-03T23:58:10Z"[..], b"2026-10-03T19:58:10-04:00", b"2026-02-29T00:00:00Z", b"2028-02-29T00:00:00Z",
                   b"2026-10-03T24:00:00Z", b"2026-10-03 23:58:10Z", b"2026-13-03T23:58:10Z", b"2026-10-03T23:58:10z", b"1791071890000",
-                  b"2026-10-03T23:58:10+24:00", b"2026-10-03T23:58:10+05:60", b"2026-10-03T23:58:10-00:00"] {
+                  b"2026-10-03T23:58:10+24:00", b"2026-10-03T23:58:10+05:60", b"2026-10-03T23:58:10-00:00",
+                  b"0", b"7", b"0001791071890000", b"1791071890000", b"9999999999999999", b"12345678", b"1234567x", b"1791071890000.0",
+                  b"\xd9\xa2\xd9\xa5", b"86400000", b"/0000000", b":0000000", b"00000000000000000000001791071890000"] {
             for _ in 0..2 {
                 assert_eq!(parse_ts_c(t, &mut dc), parse_ts(t), "{:?}", std::str::from_utf8(t));
             }
