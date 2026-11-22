@@ -37,7 +37,7 @@ jobs:
 
       - name: Time runs (container, scorer flags, 4 CPUs)
         run: |
-          note() { msg=$(awk 'BEGIN{ORS="%0A"} {gsub(/%/,"%25"); gsub(//,""); print}' "$2"); echo "::notice title=$1::$msg"; }
+          note() { msg=$(awk 'BEGIN{ORS="%0A"} {gsub(/%/,"%25"); print}' "$2"); echo "::notice title=$1::$msg"; }
           run() {
             rm -rf /tmp/out && mkdir -p /tmp/out /tmp/scr && chmod 777 /tmp/out /tmp/scr
             /usr/bin/time -f "$1 wall %e s  maxrss %M KB" docker run --rm --network none --read-only \
