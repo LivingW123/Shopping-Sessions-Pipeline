@@ -53,6 +53,10 @@ jobs:
           cat /tmp/s20/events/* > /dev/null
           for i in 1 2 3; do run s20 /tmp/s20; done
           run s20-nc8 /tmp/s20 8
+          for st in noop scan fields parse; do
+            rm -rf /tmp/out && mkdir -p /tmp/out && chmod 777 /tmp/out
+            /usr/bin/time -f "container-$st wall %e s" docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777               --cpus 4 --memory 14g --user 1000:1000 -v /tmp/s20:/data:ro -v /tmp/out:/output -e NCPU=4 -e PIPE_VERBOSE=1 -e PIPE_STOP=$st               shopping-sessions:latest > /tmp/log.txt 2>&1; cat /tmp/log.txt; note "floor-$st" /tmp/log.txt
+          done
 
       - name: Profile (native, perf)
         continue-on-error: true

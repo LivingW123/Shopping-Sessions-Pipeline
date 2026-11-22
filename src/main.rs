@@ -653,6 +653,11 @@ struct CStat {
 
 fn main() {
     let t0 = std::time::Instant::now();
+    // measurement floors: PIPE_STOP=noop|scan|fields|parse stops early (no output)
+    let stop = std::env::var("PIPE_STOP").unwrap_or_default();
+    if stop == "noop" {
+        std::process::exit(0);
+    }
     let args: Vec<String> = std::env::args().collect();
     let data_dir = PathBuf::from(
         std::env::var("DATA_DIR").ok().or_else(|| args.get(1).cloned()).unwrap_or("/data".into()),
@@ -771,6 +776,33 @@ fn main() {
     let target = (total_bytes / (threads * 16)).clamp(1 << 20, 32 << 20);
     let chunks = make_chunks(&files, &kinds, target);
     lap("mapped");
+    if stop == "scan" || stop == "fields" {
+        let sink = AtomicU64::new(0);
+        let ch: Vec<&Chunk> = chunks.iter().collect();
+        run_par(threads, ch.len(), Scan::new, |sc, i| {
+            let c = ch[i];
+            let d = files.data(c.file);
+            let mut n = 0u64;
+            if stop == "scan" {
+                let mut p = c.start;
+                while p < c.end {
+                    let e = (p + SEG).min(c.end);
+                    scan_segment(&d[p..e], sc);
+                    n += sc.sep.len() as u64;
+                    p = e;
+                }
+            } else if c.kind == Kind::Event {
+                for_records::<7>(d, c.start, c.end, sc, |f| n += f[2].len() as u64);
+            } else if c.kind == Kind::Click {
+                for_records::<4>(d, c.start, c.end, sc, |f| n += f[3].len() as u64);
+            } else {
+                for_records::<2>(d, c.start, c.end, sc, |f| n += f[1].len() as u64);
+            }
+            sink.fetch_add(n, Ordering::Relaxed);
+        });
+        lap(&format!("{} done ({})", stop, sink.load(Ordering::Relaxed)));
+        std::process::exit(0);
+    }
 
     // ---------------- links
     let link_chunks: Vec<&Chunk> = chunks.iter().filter(|c| c.kind == Kind::Link).collect();
@@ -1057,6 +1089,9 @@ fn main() {
         },
     );
     lap("parsed");
+    if stop == "parse" {
+        std::process::exit(0);
+    }
     let mut p2: Vec<Blocks<SRec>> = Vec::new();
     let mut p1ck: Vec<Blocks<CRec>> = Vec::new();
     for x in p1 {
