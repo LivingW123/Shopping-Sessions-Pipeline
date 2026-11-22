@@ -22,13 +22,11 @@ use mem::Blocks;
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use util::*;
 
 const LINKED: u64 = 1 << 63;
-const EB_BITS: u32 = 8; // event-id buckets
 const PB_BITS: u32 = 8; // person buckets
-const NEB: usize = 1 << EB_BITS;
 const NPB: usize = 1 << PB_BITS;
 const SEED_U: u64 = 0x1234_5678_9abc_def1;
 const SEED_P: u64 = 0x5eed_0f_9a_11_ce_d0;
@@ -545,7 +543,7 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8))
-        .max(1);
+        .clamp(1, 256);
     let verbose = std::env::var("PIPE_VERBOSE").is_ok();
     let lap = |what: &str| {
         if verbose {
@@ -677,73 +675,126 @@ fn main() {
     );
     let link_parts: Vec<Vec<(u64, u64, u64, u64)>> = link_parts.into_iter().map(|x| x.0).collect();
     let nlinks: usize = link_parts.iter().map(|v| v.len()).sum();
-    let mut idmap = U64Map::with_capacity(nlinks * 2 + 16);
-    let mut id_loc: Vec<u64> = Vec::with_capacity(nlinks * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(nlinks * 2);
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        let mut r = x;
-        while parent[r as usize] != r {
-            r = parent[r as usize];
-        }
-        while parent[x as usize] != r {
-            let n = parent[x as usize];
-            parent[x as usize] = r;
-            x = n;
-        }
-        r
-    }
-    for part in &link_parts {
-        for &(ha, hb, la, lb) in part {
-            let (a, ins) = idmap.get_or_insert(ha, id_loc.len() as u32);
-            if ins {
-                id_loc.push(la);
-                parent.push(a);
+    // (a) lock-free interning: slot index = id
+    let lcap = (nlinks * 4).next_power_of_two().max(64);
+    let lmask = lcap - 1;
+    let lkeys: Vec<AtomicU64> = (0..lcap).map(|_| AtomicU64::new(0)).collect();
+    let lloc: Vec<AtomicU64> = (0..lcap).map(|_| AtomicU64::new(0)).collect();
+    let intern = |h: u64, loc: u64| -> u32 {
+        let mut i = (h as usize) & lmask;
+        loop {
+            let k = lkeys[i].load(Ordering::Relaxed);
+            if k == h {
+                return i as u32;
             }
-            let (b, ins) = idmap.get_or_insert(hb, id_loc.len() as u32);
-            if ins {
-                id_loc.push(lb);
-                parent.push(b);
-            }
-            let ra = find(&mut parent, a);
-            let rb = find(&mut parent, b);
-            if ra != rb {
-                if ra < rb {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
+            if k == 0 {
+                match lkeys[i].compare_exchange(0, h, Ordering::AcqRel, Ordering::Relaxed) {
+                    Ok(_) => {
+                        lloc[i].store(loc, Ordering::Relaxed);
+                        return i as u32;
+                    }
+                    Err(x) if x == h => return i as u32,
+                    Err(_) => {}
                 }
             }
+            i = (i + 1) & lmask;
         }
-    }
+    };
+    let edge_parts: Vec<Vec<(u32, u32)>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = link_parts
+            .iter()
+            .map(|part| {
+                let intern = &intern;
+                sc.spawn(move || part.iter().map(|&(ha, hb, la, lb)| (intern(ha, la), intern(hb, lb))).collect())
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
     drop(link_parts);
-    let nids = id_loc.len();
-    // person index per root, name = smallest id
-    let mut person_of_root: Vec<u32> = vec![u32::MAX; nids];
-    let mut person_name: Vec<u64> = Vec::new();
-    let mut person_of: Vec<u32> = vec![0; nids];
-    for i in 0..nids {
-        let r = find(&mut parent, i as u32) as usize;
-        if person_of_root[r] == u32::MAX {
-            person_of_root[r] = person_name.len() as u32;
-            person_name.push(id_loc[i]);
-        } else {
-            let p = person_of_root[r] as usize;
-            if files.get(id_loc[i]) < files.get(person_name[p]) {
-                person_name[p] = id_loc[i];
+    let lloc: Vec<u64> = lloc.into_iter().map(|x| x.into_inner()).collect();
+    // (b) concurrent union-find; the byte-wise smaller ID string always becomes the root
+    let parent: Vec<AtomicU32> = (0..lcap as u32).map(AtomicU32::new).collect();
+    let find = |mut x: u32| -> u32 {
+        loop {
+            let p = parent[x as usize].load(Ordering::Acquire);
+            if p == x {
+                return x;
             }
+            let gp = parent[p as usize].load(Ordering::Acquire);
+            if gp != p {
+                let _ = parent[x as usize].compare_exchange(p, gp, Ordering::AcqRel, Ordering::Relaxed);
+            }
+            x = gp;
         }
-        person_of[i] = person_of_root[r];
-    }
-    for s in idmap.slots.iter_mut() {
-        if s.v != u32::MAX {
-            s.v = person_of[s.v as usize];
+    };
+    std::thread::scope(|sc| {
+        for part in &edge_parts {
+            let find = &find;
+            let parent = &parent;
+            let lloc = &lloc;
+            let files = &files;
+            sc.spawn(move || {
+                for &(a, b) in part {
+                    loop {
+                        let ra = find(a);
+                        let rb = find(b);
+                        if ra == rb {
+                            break;
+                        }
+                        let (small, big) =
+                            if files.get(lloc[ra as usize]) < files.get(lloc[rb as usize]) { (ra, rb) } else { (rb, ra) };
+                        if parent[big as usize]
+                            .compare_exchange(big, small, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+                }
+            });
         }
-    }
+    });
+    drop(edge_parts);
+    // (c) lookup table: same layout, value = root slot; person name = root's ID
+    let nlt = threads.max(1);
+    let per = lcap.div_ceil(nlt);
+    let mut slots: Vec<Slot> = Vec::with_capacity(lcap);
+    unsafe { slots.set_len(lcap) };
+    let counts: Vec<(usize, usize)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = slots
+            .chunks_mut(per)
+            .enumerate()
+            .map(|(ci, ch)| {
+                let find = &find;
+                let lkeys = &lkeys;
+                sc.spawn(move || {
+                    let mut nid = 0;
+                    let mut nroot = 0;
+                    for (j, s) in ch.iter_mut().enumerate() {
+                        let i = ci * per + j;
+                        let k = lkeys[i].load(Ordering::Relaxed);
+                        if k == 0 {
+                            *s = Slot { k: 0, v: u32::MAX };
+                        } else {
+                            let r = find(i as u32);
+                            nid += 1;
+                            nroot += (r == i as u32) as usize;
+                            *s = Slot { k, v: r };
+                        }
+                    }
+                    (nid, nroot)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let nids: usize = counts.iter().map(|c| c.0).sum();
+    let npersons: usize = counts.iter().map(|c| c.1).sum();
+    let link_table = U64Map { slots, mask: lmask };
+    let person_name: Vec<u64> = lloc;
     drop(parent);
-    drop(person_of_root);
-    drop(person_of);
-    let link_table = idmap;
-    lap(&format!("links: {} lines, {} ids, {} persons", nlinks, nids, person_name.len()));
+    drop(lkeys);
+    lap(&format!("links: {} lines, {} ids, {} persons", nlinks, nids, npersons));
 
     // ---------------- parse events and clicks
     let resolve_h = |h: u64| -> u64 {
@@ -753,8 +804,6 @@ fn main() {
         }
     };
     let ec_chunks: Vec<&Chunk> = chunks.iter().filter(|c| c.kind != Kind::Link).collect();
-    let ev_bytes: usize = (0..kinds.len()).filter(|&i| kinds[i] == Kind::Event).map(|i| files.data(i).len()).sum();
-    let ck_bytes: usize = (0..kinds.len()).filter(|&i| kinds[i] == Kind::Click).map(|i| files.data(i).len()).sum();
     const BATCH: usize = 64;
     struct P1 {
         ev: Blocks<EvRec>,
@@ -764,12 +813,24 @@ fn main() {
         pev: Vec<EvRec>,
         pck: Vec<CRec>,
     }
+    // bucket sizing from input volume: ~12k events per event-id bucket keeps
+    // the dedup table and its records in L2
+    let ev_bytes: usize = (0..kinds.len()).filter(|&i| kinds[i] == Kind::Event).map(|i| files.data(i).len()).sum();
+    let ck_bytes: usize = (0..kinds.len()).filter(|&i| kinds[i] == Kind::Click).map(|i| files.data(i).len()).sum();
+    let est_ev = ev_bytes / 95 + 1;
+    let est_ck = ck_bytes / 55 + 1;
+    let eb_bits: u32 = ((est_ev / 12_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 14);
+    let neb = 1usize << eb_bits;
+    // block ~ half of a thread's share of one bucket, so partial tail blocks waste little
+    let ev_blk = (est_ev / neb / threads / 2).clamp(16, 1024);
+    let ck_blk = (est_ck / NPB / threads / 2).clamp(16, 1024);
+    let sr_blk = (est_ev / NPB / threads / 2).clamp(16, 1024);
     let flush_ev = |st_ev: &mut Blocks<EvRec>, pev: &mut Vec<EvRec>| {
         for r in pev.iter_mut() {
             if r.etype != 0 {
                 r.ukey = resolve_h(r.ukey);
             }
-            st_ev.push((r.h1 >> (64 - EB_BITS)) as usize, *r);
+            st_ev.push((r.h1 >> (64 - eb_bits)) as usize, *r);
         }
         pev.clear();
     };
@@ -784,8 +845,8 @@ fn main() {
         threads,
         ec_chunks.len(),
         || P1 {
-            ev: Blocks::new(NEB),
-            ck: Blocks::new(NPB),
+            ev: Blocks::new(neb, ev_blk),
+            ck: Blocks::new(NPB, ck_blk),
             pos: Scan::new(),
             dc: DateCache::new(),
             pev: Vec::with_capacity(BATCH),
@@ -895,54 +956,79 @@ fn main() {
     struct P2 {
         out: Blocks<SRec>,
         tab: Vec<DSlot>,
+        win: Vec<u64>,
     }
     let p2: Vec<P2> = run_par(
         threads,
-        NEB,
-        || P2 { out: Blocks::new(NPB), tab: Vec::new() },
+        neb,
+        || P2 { out: Blocks::new(NPB, sr_blk), tab: Vec::new(), win: Vec::new() },
         |st, b| {
-            let n: usize = p1ev.iter().map(|t| t.len(b)).sum();
+            let mut offs = [0usize; 257];
+            let nt = p1ev.len();
+            for t in 0..nt {
+                offs[t + 1] = offs[t] + p1ev[t].len(b);
+            }
+            let n = offs[nt];
             if n == 0 {
                 return;
             }
+            let rec = |g: usize| -> &EvRec {
+                let mut t = 0;
+                while offs[t + 1] <= g {
+                    t += 1;
+                }
+                p1ev[t].get(b, g - offs[t])
+            };
             let cap = (n * 2).next_power_of_two();
             let mask = cap - 1;
             let tab = &mut st.tab;
             tab.clear();
             tab.resize(cap, DSlot { h1: 0, ingest: 0, r: u32::MAX });
-            for (t, src) in p1ev.iter().enumerate() {
-                for (i, r) in src.iter(b).enumerate() {
-                    let me = ((t as u32) << 24) | i as u32;
-                    let mut s = ((r.h1 >> 20) as usize) & mask;
-                    loop {
-                        let x = tab[s];
-                        if x.r == u32::MAX {
-                            tab[s] = DSlot { h1: r.h1, ingest: r.ingest, r: me };
-                            break;
-                        }
-                        if x.h1 == r.h1 {
-                            let o = p1ev[(x.r >> 24) as usize].get(b, (x.r & 0xff_ffff) as usize);
-                            if files.get(o.eloc) == files.get(r.eloc) {
+            let mut g = 0u32;
+            for src in p1ev.iter() {
+                for sl in src.slices(b) {
+                    for r in sl {
+                        let mut s = ((r.h1 >> 20) as usize) & mask;
+                        loop {
+                            let x = tab[s];
+                            if x.r == u32::MAX {
+                                tab[s] = DSlot { h1: r.h1, ingest: r.ingest, r: g };
+                                break;
+                            }
+                            if x.h1 == r.h1 && files.get(rec(x.r as usize).eloc) == files.get(r.eloc) {
                                 if r.ingest < x.ingest {
-                                    tab[s] = DSlot { h1: r.h1, ingest: r.ingest, r: me };
+                                    tab[s] = DSlot { h1: r.h1, ingest: r.ingest, r: g };
                                 }
                                 break;
                             }
+                            s = (s + 1) & mask;
                         }
-                        s = (s + 1) & mask;
+                        g += 1;
                     }
                 }
             }
-            let out = &mut st.out;
+            let win = &mut st.win;
+            win.clear();
+            win.resize(n.div_ceil(64), 0);
             for x in tab.iter() {
-                if x.r == u32::MAX {
-                    continue;
+                if x.r != u32::MAX {
+                    win[(x.r >> 6) as usize] |= 1u64 << (x.r & 63);
                 }
-                let r = p1ev[(x.r >> 24) as usize].get(b, (x.r & 0xff_ffff) as usize);
-                if r.etype == 0 {
-                    continue;
+            }
+            let out = &mut st.out;
+            let mut g = 0usize;
+            for src in p1ev.iter() {
+                for sl in src.slices(b) {
+                    for r in sl {
+                        if r.etype != 0 && (win[g >> 6] >> (g & 63)) & 1 != 0 {
+                            out.push(
+                                pbucket(r.ukey),
+                                SRec { ukey: r.ukey, uloc: r.uloc, pk: pack_ev(r.ts, r.etype, r.price, r.cat) },
+                            );
+                        }
+                        g += 1;
+                    }
                 }
-                out.push(pbucket(r.ukey), SRec { ukey: r.ukey, uloc: r.uloc, pk: pack_ev(r.ts, r.etype, r.price, r.cat) });
             }
         },
     );

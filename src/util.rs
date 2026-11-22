@@ -32,7 +32,8 @@ pub fn hash64(b: &[u8], seed: u64) -> u64 {
         let w = u64::from_le_bytes(t);
         h = mum(w ^ P3, h ^ P1);
     }
-    mum(h ^ P2, (n as u64) ^ P0 ^ seed)
+    let r = mum(h ^ P2, (n as u64) ^ P0 ^ seed);
+    r | (r == 0) as u64 // never 0: 0 marks empty slots
 }
 
 /// Splits one line (without its `\n`) into exactly N fields, stripping the

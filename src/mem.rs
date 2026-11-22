@@ -50,15 +50,15 @@ unsafe impl GlobalAlloc for Alloc {
     }
 }
 
-pub const BLK: usize = 1024;
-const CHUNK_BLOCKS: usize = 128;
+const CHUNK_BYTES: usize = 8 << 20;
 
-/// Per-bucket append-only storage in fixed blocks of BLK records, carved
-/// sequentially from large chunks. Records are never moved.
+/// Per-bucket append-only storage in fixed blocks (power-of-two records),
+/// carved sequentially from large chunks. Records are never moved.
 pub struct Blocks<T: Copy> {
     chunks: Vec<Vec<T>>,
     chunk_ptr: *mut T,
     chunk_left: usize, // blocks left in current chunk
+    shift: u32,
     blocks: Vec<Vec<*mut T>>,
     cur: Vec<*mut T>,
     n: Vec<u32>,
@@ -68,26 +68,34 @@ unsafe impl<T: Copy + Send> Send for Blocks<T> {}
 unsafe impl<T: Copy + Sync> Sync for Blocks<T> {}
 
 impl<T: Copy> Blocks<T> {
-    pub fn new(nb: usize) -> Self {
+    /// `blk` is rounded up to a power of two.
+    pub fn new(nb: usize, blk: usize) -> Self {
         Blocks {
             chunks: Vec::new(),
             chunk_ptr: std::ptr::null_mut(),
             chunk_left: 0,
+            shift: blk.max(16).next_power_of_two().trailing_zeros(),
             blocks: (0..nb).map(|_| Vec::new()).collect(),
             cur: vec![std::ptr::null_mut(); nb],
             n: vec![0; nb],
         }
     }
+    #[inline(always)]
+    fn blk(&self) -> usize {
+        1 << self.shift
+    }
     #[cold]
     fn new_block(&mut self, b: usize) {
+        let blk = self.blk();
         if self.chunk_left == 0 {
-            let mut v: Vec<T> = Vec::with_capacity(BLK * CHUNK_BLOCKS);
+            let per = (CHUNK_BYTES / (blk * std::mem::size_of::<T>())).max(1);
+            let mut v: Vec<T> = Vec::with_capacity(blk * per);
             self.chunk_ptr = v.as_mut_ptr();
             self.chunks.push(v);
-            self.chunk_left = CHUNK_BLOCKS;
+            self.chunk_left = per;
         }
         let p = self.chunk_ptr;
-        self.chunk_ptr = unsafe { p.add(BLK) };
+        self.chunk_ptr = unsafe { p.add(blk) };
         self.chunk_left -= 1;
         self.blocks[b].push(p);
         self.cur[b] = p;
@@ -95,7 +103,7 @@ impl<T: Copy> Blocks<T> {
     #[inline(always)]
     pub fn push(&mut self, b: usize, v: T) {
         let n = self.n[b] as usize;
-        let off = n % BLK;
+        let off = n & (self.blk() - 1);
         if off == 0 {
             self.new_block(b);
         }
@@ -108,14 +116,20 @@ impl<T: Copy> Blocks<T> {
     }
     #[inline(always)]
     pub fn get(&self, b: usize, i: usize) -> &T {
-        unsafe { &*self.blocks[b][i / BLK].add(i % BLK) }
+        unsafe { &*self.blocks[b].get_unchecked(i >> self.shift).add(i & (self.blk() - 1)) }
+    }
+    /// The bucket's records as contiguous slices, in push order.
+    #[inline]
+    pub fn slices(&self, b: usize) -> impl Iterator<Item = &[T]> + '_ {
+        let n = self.n[b] as usize;
+        let blk = self.blk();
+        self.blocks[b].iter().enumerate().map(move |(k, &p)| {
+            let len = (n - k * blk).min(blk);
+            unsafe { std::slice::from_raw_parts(p as *const T, len) }
+        })
     }
     #[inline]
     pub fn iter(&self, b: usize) -> impl Iterator<Item = &T> + '_ {
-        let n = self.n[b] as usize;
-        self.blocks[b].iter().enumerate().flat_map(move |(k, &p)| {
-            let len = (n - k * BLK).min(BLK);
-            unsafe { std::slice::from_raw_parts(p as *const T, len) }.iter()
-        })
+        self.slices(b).flatten()
     }
 }
