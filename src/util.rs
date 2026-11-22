@@ -138,6 +138,87 @@ fn parse_datetime19(b: &[u8]) -> Option<i64> {
     Some(((days * 86_400) + (h as i64) * 3600 + (mi as i64) * 60 + s as i64) * 1000)
 }
 
+/// Direct-mapped cache of validated `YYYY-MM-DD` prefixes -> days since epoch.
+pub struct DateCache {
+    keys: [(u64, u16); 64],
+    days: [i64; 64],
+}
+
+impl DateCache {
+    pub fn new() -> Self {
+        DateCache { keys: [(0, 0); 64], days: [i64::MIN; 64] }
+    }
+}
+
+/// Parses `YYYY-MM-DDTHH:MM:SS` with a date cache.
+#[inline(always)]
+fn parse_datetime19_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
+    let k1 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let k2 = u16::from_le_bytes(b[8..10].try_into().unwrap());
+    let slot = ((b[9] as usize) ^ ((b[8] as usize) << 1) ^ ((b[6] as usize) << 3)) & 63;
+    let days = if dc.keys[slot] == (k1, k2) && dc.days[slot] != i64::MIN {
+        dc.days[slot]
+    } else {
+        if b[4] != b'-' || b[7] != b'-' {
+            return None;
+        }
+        let y = (d2(b, 0)? * 100 + d2(b, 2)?) as i64;
+        let mo = d2(b, 5)?;
+        let d = d2(b, 8)?;
+        if !(1..=12).contains(&mo) || d == 0 {
+            return None;
+        }
+        let dim = match mo {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => {
+                if is_leap(y) {
+                    29
+                } else {
+                    28
+                }
+            }
+        };
+        if d > dim {
+            return None;
+        }
+        let days = days_from_civil(y, mo, d);
+        dc.keys[slot] = (k1, k2);
+        dc.days[slot] = days;
+        days
+    };
+    if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let h = d2(b, 11)?;
+    let mi = d2(b, 14)?;
+    let s = d2(b, 17)?;
+    if h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    Some(((days * 86_400) + (h as i64) * 3600 + (mi as i64) * 60 + s as i64) * 1000)
+}
+
+/// `parse_ts` with a date cache.
+#[inline]
+pub fn parse_ts_c(b: &[u8], dc: &mut DateCache) -> Option<i64> {
+    let n = b.len();
+    if n == 20 && b[19] == b'Z' {
+        return parse_datetime19_c(b, dc);
+    }
+    if n == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+        let base = parse_datetime19_c(b, dc)?;
+        let oh = d2(b, 20)?;
+        let om = d2(b, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let off = ((oh as i64) * 60 + om as i64) * 60_000;
+        return Some(if b[19] == b'+' { base - off } else { base + off });
+    }
+    parse_ts(b)
+}
+
 /// Parses an event/click `ts` (F1, F2 or F3). Returns None for a bad
 /// timestamp. F3 values that overflow i64 return i64::MAX (outside any window).
 #[inline]
@@ -224,6 +305,17 @@ mod tests {
         assert_eq!(parse_ts(b"2026-10-03T23:58:10+0200"), None);
         assert_eq!(parse_ts(b"1.79e12"), None);
         assert_eq!(parse_ts(b"999999999999999999999"), Some(i64::MAX));
+    }
+    #[test]
+    fn ts_cache() {
+        let mut dc = DateCache::new();
+        for t in [&b"2026-10-03T23:58:10Z"[..], b"2026-10-03T19:58:10-04:00", b"2026-02-29T00:00:00Z", b"2028-02-29T00:00:00Z",
+                  b"2026-10-03T24:00:00Z", b"2026-10-03 23:58:10Z", b"2026-13-03T23:58:10Z", b"2026-10-03T23:58:10z", b"1791071890000",
+                  b"2026-10-03T23:58:10+24:00", b"2026-10-03T23:58:10+05:60", b"2026-10-03T23:58:10-00:00"] {
+            for _ in 0..2 {
+                assert_eq!(parse_ts_c(t, &mut dc), parse_ts(t), "{:?}", std::str::from_utf8(t));
+            }
+        }
     }
     #[test]
     fn fields() {

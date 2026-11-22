@@ -11,8 +11,13 @@
 //!  5. Per person bucket: sort, sessionize, credit and assist, aggregate.
 //!  6. Write Parquet.
 
+mod mem;
 mod parquet;
 mod util;
+
+#[global_allocator]
+static GLOBAL: mem::Alloc = mem::Alloc;
+use mem::Blocks;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -21,11 +26,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use util::*;
 
 const LINKED: u64 = 1 << 63;
-const EB_BITS: u32 = 10; // event-id buckets
-const PB_BITS: u32 = 10; // person buckets
+const EB_BITS: u32 = 8; // event-id buckets
+const PB_BITS: u32 = 8; // person buckets
 const NEB: usize = 1 << EB_BITS;
 const NPB: usize = 1 << PB_BITS;
 const SEED_U: u64 = 0x1234_5678_9abc_def1;
+const SEED_P: u64 = 0x5eed_0f_9a_11_ce_d0;
 const SEED_E1: u64 = 0x0f1e_2d3c_4b5a_6978;
 
 // ---------------------------------------------------------------- files
@@ -116,50 +122,68 @@ fn make_chunks(files: &Files, file_kinds: &[Kind], target: usize) -> Vec<Chunk> 
 
 const SEG: usize = 1 << 16;
 
-/// Appends the offsets (relative to `s`) of every `,` `\n` `"` in `s`.
-fn scan_structural(s: &[u8], out: &mut Vec<u32>) {
-    out.reserve(s.len() + 64);
+/// Scratch for one segment: separator offsets (`,` and `\n`) and a bitmask of `"`.
+pub struct Scan {
+    sep: Vec<u32>,
+    qbits: Vec<u64>,
+}
+
+impl Scan {
+    fn new() -> Self {
+        Scan { sep: Vec::with_capacity(SEG / 4), qbits: Vec::with_capacity(SEG / 64 + 2) }
+    }
+}
+
+fn scan_segment(s: &[u8], sc: &mut Scan) {
+    sc.sep.clear();
+    sc.qbits.clear();
+    sc.sep.reserve(s.len() + 64);
     let mut i = 0usize;
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
-            i = unsafe { scan_avx2(s, out) };
+            i = unsafe { scan_avx2(s, sc) };
         }
     }
+    // scalar tail, in 64-byte words
     while i < s.len() {
-        let c = s[i];
-        if c == b',' || c == b'\n' || c == b'"' {
-            out.push(i as u32);
+        let e = (i + 64).min(s.len());
+        let mut q = 0u64;
+        for j in i..e {
+            let c = s[j];
+            if c == b',' || c == b'\n' {
+                sc.sep.push(j as u32);
+            } else if c == b'"' {
+                q |= 1 << (j - i);
+            }
         }
-        i += 1;
+        sc.qbits.push(q);
+        i = e;
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi1")]
-unsafe fn scan_avx2(s: &[u8], out: &mut Vec<u32>) -> usize {
+#[target_feature(enable = "avx2,bmi1,popcnt")]
+unsafe fn scan_avx2(s: &[u8], sc: &mut Scan) -> usize {
     use std::arch::x86_64::*;
     let comma = _mm256_set1_epi8(b',' as i8);
     let nl = _mm256_set1_epi8(b'\n' as i8);
-    let q = _mm256_set1_epi8(b'"' as i8);
+    let qq = _mm256_set1_epi8(b'"' as i8);
     let p = s.as_ptr();
     let n = s.len();
     let mut i = 0usize;
-    let mut len = out.len();
-    let dst = out.as_mut_ptr();
+    let mut len = sc.sep.len();
+    let dst = sc.sep.as_mut_ptr();
     while i + 64 <= n {
         let v0 = _mm256_loadu_si256(p.add(i) as *const __m256i);
         let v1 = _mm256_loadu_si256(p.add(i + 32) as *const __m256i);
-        let m0 = _mm256_or_si256(
-            _mm256_or_si256(_mm256_cmpeq_epi8(v0, comma), _mm256_cmpeq_epi8(v0, nl)),
-            _mm256_cmpeq_epi8(v0, q),
-        );
-        let m1 = _mm256_or_si256(
-            _mm256_or_si256(_mm256_cmpeq_epi8(v1, comma), _mm256_cmpeq_epi8(v1, nl)),
-            _mm256_cmpeq_epi8(v1, q),
-        );
-        let mut bits =
-            (_mm256_movemask_epi8(m0) as u32 as u64) | ((_mm256_movemask_epi8(m1) as u32 as u64) << 32);
+        let s0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, comma), _mm256_cmpeq_epi8(v0, nl));
+        let s1 = _mm256_or_si256(_mm256_cmpeq_epi8(v1, comma), _mm256_cmpeq_epi8(v1, nl));
+        let q0 = _mm256_cmpeq_epi8(v0, qq);
+        let q1 = _mm256_cmpeq_epi8(v1, qq);
+        let mut bits = (_mm256_movemask_epi8(s0) as u32 as u64) | ((_mm256_movemask_epi8(s1) as u32 as u64) << 32);
+        let qb = (_mm256_movemask_epi8(q0) as u32 as u64) | ((_mm256_movemask_epi8(q1) as u32 as u64) << 32);
+        sc.qbits.push(qb);
         while bits != 0 {
             let t = bits.trailing_zeros();
             *dst.add(len) = (i as u32) + t;
@@ -168,18 +192,46 @@ unsafe fn scan_avx2(s: &[u8], out: &mut Vec<u32>) -> usize {
         }
         i += 64;
     }
-    out.set_len(len);
+    sc.sep.set_len(len);
     i
+}
+
+#[inline(always)]
+fn popcnt_range(q: &[u64], a: usize, b: usize) -> u32 {
+    if a >= b {
+        return 0;
+    }
+    let wa = a >> 6;
+    let wb = (b - 1) >> 6;
+    let mut cnt = 0;
+    let mut w = wa;
+    while w <= wb {
+        let mut m = q[w];
+        if w == wa {
+            m &= !0u64 << (a & 63);
+        }
+        if w == wb {
+            let e = b - (w << 6);
+            if e < 64 {
+                m &= (1u64 << e) - 1;
+            }
+        }
+        cnt += m.count_ones();
+        w += 1;
+    }
+    cnt
 }
 
 /// Calls `f` with the N unquoted fields of every well-formed line that starts
 /// in [start, end). Malformed lines (rules.md CSV dialect) are skipped.
+/// A line is well-formed iff it has exactly N fields and every `"` in it is
+/// the first or last byte of a field that both starts and ends with `"`.
 #[inline(always)]
 fn for_records<'a, const N: usize>(
     d: &'a [u8],
     start: usize,
     end: usize,
-    pos: &mut Vec<u32>,
+    sc: &mut Scan,
     mut f: impl FnMut(&[&'a [u8]; N]),
 ) {
     let mut s = start;
@@ -192,67 +244,43 @@ fn for_records<'a, const N: usize>(
             };
         }
         let seg: &'a [u8] = &d[s..e];
-        pos.clear();
-        scan_structural(seg, pos);
-        let mut fields: [&'a [u8]; N] = [&seg[..0]; N];
-        let mut k = 0usize;
-        let mut bad = false;
-        let mut fs = 0usize;
-        let mut nq = 0u32;
-        let mut q0 = 0usize;
-        let mut q1 = 0usize;
-        for &p in pos.iter() {
-            let p = p as usize;
-            let ch = seg[p];
-            if ch == b'"' {
-                if nq == 0 {
-                    q0 = p;
-                } else {
-                    q1 = p;
-                }
-                nq += 1;
-                continue;
-            }
-            if !bad {
-                if k >= N {
-                    bad = true;
-                } else {
-                    if nq == 0 {
-                        fields[k] = &seg[fs..p];
-                    } else if nq == 2 && q0 == fs && q1 + 1 == p && p - fs >= 2 {
-                        fields[k] = &seg[fs + 1..p - 1];
-                    } else {
-                        bad = true;
-                    }
-                    k += 1;
-                }
-            }
-            nq = 0;
-            fs = p + 1;
-            if ch == b'\n' {
-                if !bad && k == N {
-                    f(&fields);
-                }
-                k = 0;
-                bad = false;
-            }
+        scan_segment(seg, sc);
+        let slen = seg.len();
+        if slen > 0 && seg[slen - 1] != b'\n' {
+            sc.sep.push(slen as u32); // virtual line end
         }
-        if fs < seg.len() {
-            // last line of the file without a trailing newline
-            let p = seg.len();
-            if !bad && k < N {
-                if nq == 0 {
-                    fields[k] = &seg[fs..p];
-                } else if nq == 2 && q0 == fs && q1 + 1 == p && p - fs >= 2 {
-                    fields[k] = &seg[fs + 1..p - 1];
-                } else {
-                    bad = true;
+        let sep = &sc.sep[..];
+        let qbits = &sc.qbits[..];
+        let mut fields: [&'a [u8]; N] = [&seg[..0]; N];
+        let mut idx = 0usize;
+        let mut ls = 0usize;
+        while idx < sep.len() {
+            let mut k = 0usize;
+            let mut fs = ls;
+            let mut qsum = 0u32;
+            let mut p;
+            loop {
+                p = sep[idx] as usize;
+                idx += 1;
+                if k < N {
+                    let (mut a, mut b) = (fs, p);
+                    if b >= a + 2 && seg[a] == b'"' && seg[b - 1] == b'"' {
+                        a += 1;
+                        b -= 1;
+                        qsum += 2;
+                    }
+                    fields[k] = &seg[a..b];
                 }
                 k += 1;
-                if !bad && k == N {
-                    f(&fields);
+                fs = p + 1;
+                if p >= slen || seg[p] == b'\n' || idx >= sep.len() {
+                    break;
                 }
             }
+            if k == N && popcnt_range(qbits, ls, p.min(slen)) == qsum {
+                f(&fields);
+            }
+            ls = p + 1;
         }
         s = e;
     }
@@ -434,10 +462,12 @@ struct EvRec {
 struct SRec {
     ukey: u64,
     uloc: u64,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    etype: u8,
+    pk: u64, // ts_rel << 33 | etype << 31 | price << 7 | cat
+}
+
+#[inline(always)]
+fn pack_ev(ts_rel: u32, etype: u8, price: u32, cat: u16) -> u64 {
+    ((ts_rel as u64) << 33) | ((etype as u64) << 31) | ((price as u64) << 7) | cat as u64
 }
 
 #[derive(Clone, Copy)]
@@ -528,6 +558,7 @@ fn main() {
     let ws = manifest_ts(&man, "window_start");
     let we = manifest_ts(&man, "window_end");
     let cws = ws - WEEK_MS;
+    assert!(we - ws < (1i64 << 31), "window longer than 24 days");
     let ws_day = ws.div_euclid(DAY_MS);
     let ndays = ((we - 1).div_euclid(DAY_MS) - ws_day + 1).max(1) as usize;
 
@@ -551,6 +582,7 @@ fn main() {
         })
     };
     let ncat = cat_names.len();
+    assert!(ncat <= 128, "more than 128 categories");
     // rank by bytes for ties
     let mut order: Vec<usize> = (0..ncat).collect();
     order.sort_by(|&a, &b| cat_names[a].cmp(&cat_names[b]));
@@ -571,6 +603,20 @@ fn main() {
         camp_map.insert(c.clone(), camp_ids.len() as u32);
         camp_ids.push(c.clone());
         camp_chan.push(ch.clone());
+    }
+    let mut camp_tab = U64Map::with_capacity(camp_ids.len() + 16);
+    for (i, c) in camp_ids.iter().enumerate() {
+        camp_tab.get_or_insert(hash64(c, SEED_P), i as u32);
+    }
+    let mut prod_tab = U64Map::with_capacity(products.len() + 16);
+    let mut prod_names: Vec<Vec<u8>> = Vec::with_capacity(products.len());
+    let mut prod_cat: Vec<u16> = Vec::with_capacity(products.len());
+    for (p, &c) in &products {
+        let (_, ins) = prod_tab.get_or_insert(hash64(p, SEED_P), prod_names.len() as u32);
+        if ins {
+            prod_names.push(p.clone());
+            prod_cat.push(c);
+        }
     }
     let organic = camp_ids.len() as u32;
     camp_ids.push(b"organic".to_vec());
@@ -609,10 +655,10 @@ fn main() {
 
     // ---------------- links
     let link_chunks: Vec<&Chunk> = chunks.iter().filter(|c| c.kind == Kind::Link).collect();
-    let link_parts: Vec<(Vec<(u64, u64, u64, u64)>, Vec<u32>)> = run_par(
+    let link_parts: Vec<(Vec<(u64, u64, u64, u64)>, Scan)> = run_par(
         threads,
         link_chunks.len(),
-        || (Vec::new(), Vec::new()),
+        || (Vec::new(), Scan::new()),
         |(out, pos), i| {
             let c = link_chunks[i];
             let d = files.data(c.file);
@@ -709,32 +755,28 @@ fn main() {
     let ec_chunks: Vec<&Chunk> = chunks.iter().filter(|c| c.kind != Kind::Link).collect();
     let ev_bytes: usize = (0..kinds.len()).filter(|&i| kinds[i] == Kind::Event).map(|i| files.data(i).len()).sum();
     let ck_bytes: usize = (0..kinds.len()).filter(|&i| kinds[i] == Kind::Click).map(|i| files.data(i).len()).sum();
-    // generous estimates (avg event line ~85 bytes, click ~50) so buckets rarely regrow
-    let est_ev = ev_bytes / 70 + 16;
-    let est_ck = ck_bytes / 40 + 16;
-    let ev_res = est_ev / threads / NEB * 5 / 4 + 8;
-    let ck_res = est_ck / threads / NPB * 5 / 4 + 8;
     const BATCH: usize = 64;
     struct P1 {
-        ev: Vec<Vec<EvRec>>,
-        ck: Vec<Vec<CRec>>,
-        pos: Vec<u32>,
+        ev: Blocks<EvRec>,
+        ck: Blocks<CRec>,
+        pos: Scan,
+        dc: DateCache,
         pev: Vec<EvRec>,
         pck: Vec<CRec>,
     }
-    let flush_ev = |st_ev: &mut Vec<Vec<EvRec>>, pev: &mut Vec<EvRec>| {
+    let flush_ev = |st_ev: &mut Blocks<EvRec>, pev: &mut Vec<EvRec>| {
         for r in pev.iter_mut() {
             if r.etype != 0 {
                 r.ukey = resolve_h(r.ukey);
             }
-            st_ev[(r.h1 >> (64 - EB_BITS)) as usize].push(*r);
+            st_ev.push((r.h1 >> (64 - EB_BITS)) as usize, *r);
         }
         pev.clear();
     };
-    let flush_ck = |st_ck: &mut Vec<Vec<CRec>>, pck: &mut Vec<CRec>| {
+    let flush_ck = |st_ck: &mut Blocks<CRec>, pck: &mut Vec<CRec>| {
         for r in pck.iter_mut() {
             r.ukey = resolve_h(r.ukey);
-            st_ck[pbucket(r.ukey)].push(*r);
+            st_ck.push(pbucket(r.ukey), *r);
         }
         pck.clear();
     };
@@ -742,23 +784,24 @@ fn main() {
         threads,
         ec_chunks.len(),
         || P1 {
-            ev: (0..NEB).map(|_| Vec::with_capacity(ev_res)).collect(),
-            ck: (0..NPB).map(|_| Vec::with_capacity(ck_res)).collect(),
-            pos: Vec::new(),
+            ev: Blocks::new(NEB),
+            ck: Blocks::new(NPB),
+            pos: Scan::new(),
+            dc: DateCache::new(),
             pev: Vec::with_capacity(BATCH),
             pck: Vec::with_capacity(BATCH),
         },
         |st, i| {
             let c = ec_chunks[i];
             let d = files.data(c.file);
-            let P1 { ev, ck, pos, pev, pck } = st;
+            let P1 { ev, ck, pos, dc, pev, pck } = st;
             if c.kind == Kind::Event {
                 for_records::<7>(d, c.start, c.end, pos, |f| {
                     if f[0].is_empty() {
                         return;
                     }
                     let h1 = hash64(f[0], SEED_E1);
-                    let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX);
+                    let ingest_ms = parse_ts_c(f[3], dc).unwrap_or(i64::MAX);
                     let ingest = if ingest_ms == i64::MAX {
                         u32::MAX
                     } else {
@@ -779,7 +822,7 @@ fn main() {
                         if f[1].is_empty() || f[5].is_empty() {
                             break 'v;
                         }
-                        let ts = match parse_ts(f[2]) {
+                        let ts = match parse_ts_c(f[2], dc) {
                             Some(t) if t >= ws && t < we => t,
                             _ => break 'v,
                         };
@@ -797,7 +840,10 @@ fn main() {
                                 Some(p) => r.price = p,
                                 None => break 'v,
                             }
-                            r.cat = products.get(f[5]).copied().unwrap_or(unknown_cat);
+                            r.cat = match prod_tab.get(hash64(f[5], SEED_P)) {
+                                Some(pi) if prod_names[pi as usize] == f[5] => prod_cat[pi as usize],
+                                _ => unknown_cat,
+                            };
                         }
                         r.ts = (ts - ws) as u32;
                         let h = hash64(f[1], SEED_U);
@@ -817,13 +863,13 @@ fn main() {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
-                    let ts = match parse_ts(f[3]) {
+                    let ts = match parse_ts_c(f[3], dc) {
                         Some(t) if t >= cws && t < we => t,
                         _ => return,
                     };
-                    let camp = match camp_map.get(f[2]) {
-                        Some(&c) => c,
-                        None => return,
+                    let camp = match camp_tab.get(hash64(f[2], SEED_P)) {
+                        Some(c) if camp_ids[c as usize] == f[2] => c,
+                        _ => return,
                     };
                     let h = hash64(f[1], SEED_U);
                     link_table.prefetch(h);
@@ -839,7 +885,7 @@ fn main() {
     lap("parsed");
 
     // ---------------- dedup events per event-id bucket
-    let p1ev: Vec<&Vec<Vec<EvRec>>> = p1.iter().map(|x| &x.ev).collect();
+    let p1ev: Vec<&Blocks<EvRec>> = p1.iter().map(|x| &x.ev).collect();
     #[derive(Clone, Copy)]
     struct DSlot {
         h1: u64,
@@ -847,16 +893,15 @@ fn main() {
         r: u32, // (thread << 24) | index, u32::MAX = empty
     }
     struct P2 {
-        out: Vec<Vec<SRec>>,
+        out: Blocks<SRec>,
         tab: Vec<DSlot>,
     }
-    let sr_res = est_ev / threads / NPB * 5 / 4 + 8;
     let p2: Vec<P2> = run_par(
         threads,
         NEB,
-        || P2 { out: (0..NPB).map(|_| Vec::with_capacity(sr_res)).collect(), tab: Vec::new() },
+        || P2 { out: Blocks::new(NPB), tab: Vec::new() },
         |st, b| {
-            let n: usize = p1ev.iter().map(|t| t[b].len()).sum();
+            let n: usize = p1ev.iter().map(|t| t.len(b)).sum();
             if n == 0 {
                 return;
             }
@@ -866,7 +911,7 @@ fn main() {
             tab.clear();
             tab.resize(cap, DSlot { h1: 0, ingest: 0, r: u32::MAX });
             for (t, src) in p1ev.iter().enumerate() {
-                for (i, r) in src[b].iter().enumerate() {
+                for (i, r) in src.iter(b).enumerate() {
                     let me = ((t as u32) << 24) | i as u32;
                     let mut s = ((r.h1 >> 20) as usize) & mask;
                     loop {
@@ -876,7 +921,7 @@ fn main() {
                             break;
                         }
                         if x.h1 == r.h1 {
-                            let o = &p1ev[(x.r >> 24) as usize][b][(x.r & 0xff_ffff) as usize];
+                            let o = p1ev[(x.r >> 24) as usize].get(b, (x.r & 0xff_ffff) as usize);
                             if files.get(o.eloc) == files.get(r.eloc) {
                                 if r.ingest < x.ingest {
                                     tab[s] = DSlot { h1: r.h1, ingest: r.ingest, r: me };
@@ -893,31 +938,25 @@ fn main() {
                 if x.r == u32::MAX {
                     continue;
                 }
-                let r = &p1ev[(x.r >> 24) as usize][b][(x.r & 0xff_ffff) as usize];
+                let r = p1ev[(x.r >> 24) as usize].get(b, (x.r & 0xff_ffff) as usize);
                 if r.etype == 0 {
                     continue;
                 }
-                out[pbucket(r.ukey)].push(SRec {
-                    ukey: r.ukey,
-                    uloc: r.uloc,
-                    ts: ws + r.ts as i64,
-                    price: r.price,
-                    cat: r.cat,
-                    etype: r.etype,
-                });
+                out.push(pbucket(r.ukey), SRec { ukey: r.ukey, uloc: r.uloc, pk: pack_ev(r.ts, r.etype, r.price, r.cat) });
             }
         },
     );
     drop(p1ev);
-    let p2: Vec<Vec<Vec<SRec>>> = p2.into_iter().map(|x| x.out).collect();
-    let p1ck: Vec<Vec<Vec<CRec>>> = p1.into_iter().map(|x| x.ck).collect();
+    let p2: Vec<Blocks<SRec>> = p2.into_iter().map(|x| x.out).collect();
+    let p1ck: Vec<Blocks<CRec>> = p1.into_iter().map(|x| x.ck).collect();
     lap("deduped");
 
     // ---------------- per person bucket
     struct P3 {
         rows: Vec<UserRow>,
         stats: Vec<CStat>,
-        evs: Vec<SRec>,
+        evs: Vec<u64>,
+        names: Vec<u64>,
         cks: Vec<CRec>,
         tm: [u128; 4],
         lmap: LMap,
@@ -932,6 +971,7 @@ fn main() {
         threads,
         NPB,
         || P3 { rows: Vec::new(), stats: vec![CStat::default(); ncamp * ndays], evs: Vec::new(),
+            names: Vec::new(),
             cks: Vec::new(),
             tm: [0; 4],
             lmap: LMap::new(),
@@ -943,7 +983,7 @@ fn main() {
             coff: Vec::new(),
         },
         |st, b| {
-            let n: usize = p2.iter().map(|t| t[b].len()).sum();
+            let n: usize = p2.iter().map(|t| t.len(b)).sum();
             if n == 0 {
                 return;
             }
@@ -955,11 +995,14 @@ fn main() {
             lids.clear();
             let cnt = &mut st.cnt;
             cnt.clear();
+            let names = &mut st.names;
+            names.clear();
             for t in &p2 {
-                for r in &t[b] {
+                for r in t.iter(b) {
                     let (l, ins) = lm.get_or_insert(r.ukey);
                     if ins {
                         cnt.push(0);
+                        names.push(if r.ukey & LINKED != 0 { person_name[(r.ukey & !LINKED) as usize] } else { r.uloc });
                     }
                     cnt[l as usize] += 1;
                     lids.push(l);
@@ -977,13 +1020,13 @@ fn main() {
             }
             let evs = &mut st.evs;
             evs.clear();
-            evs.resize(n, SRec { ukey: 0, uloc: 0, ts: 0, price: 0, cat: 0, etype: 0 });
+            evs.resize(n, 0);
             let mut k = 0;
             for t in &p2 {
-                for r in &t[b] {
+                for r in t.iter(b) {
                     let l = lids[k] as usize;
                     k += 1;
-                    evs[cnt[l] as usize] = *r;
+                    evs[cnt[l] as usize] = r.pk;
                     cnt[l] += 1;
                 }
             }
@@ -994,7 +1037,7 @@ fn main() {
             ccnt.clear();
             ccnt.resize(m, 0);
             for t in &p1ck {
-                for r in &t[b] {
+                for r in t.iter(b) {
                     let l = lm.get(r.ukey);
                     if l != u32::MAX {
                         ccnt[l as usize] += 1;
@@ -1017,7 +1060,7 @@ fn main() {
             cks.resize(nc, CRec { ukey: 0, ts: 0, cloc: 0, camp: 0 });
             let mut k = 0;
             for t in &p1ck {
-                for r in &t[b] {
+                for r in t.iter(b) {
                     let l = cl[k];
                     k += 1;
                     if l != u32::MAX {
@@ -1030,7 +1073,7 @@ fn main() {
             for l in 0..m {
                 let g = &mut evs[eoff[l] as usize..eoff[l + 1] as usize];
                 if g.len() > 1 {
-                    g.sort_unstable_by_key(|r| r.ts);
+                    g.sort_unstable();
                 }
             }
             let t2 = std::time::Instant::now();
@@ -1041,13 +1084,13 @@ fn main() {
                 }
             }
             let t3 = std::time::Instant::now();
-            process_bucket(&st.evs, &st.eoff, &st.cks, &st.coff, &mut st.rows, &mut st.stats, &Ctx {
+            process_bucket(&st.evs, &st.eoff, &st.names, &st.cks, &st.coff, &mut st.rows, &mut st.stats, &Ctx {
                 ws_day,
                 ndays,
                 ncat,
                 cat_rank: &cat_rank,
                 organic,
-                person_name: &person_name,
+                ws,
             });
             let t4 = std::time::Instant::now();
             st.tm[0] += (t1 - t0).as_nanos();
@@ -1146,6 +1189,8 @@ fn main() {
         });
     }
     lap("written");
+    // skip tearing down gigabytes of buffers
+    std::process::exit(0);
 }
 
 struct Ctx<'a> {
@@ -1154,7 +1199,7 @@ struct Ctx<'a> {
     ncat: usize,
     cat_rank: &'a [u32],
     organic: u32,
-    person_name: &'a [u64],
+    ws: i64,
 }
 
 struct Sess {
@@ -1165,8 +1210,9 @@ struct Sess {
 }
 
 fn process_bucket(
-    evs: &[SRec],
+    evs: &[u64],
     eoff: &[u32],
+    names: &[u64],
     cks: &[CRec],
     coff: &[u32],
     rows: &mut Vec<UserRow>,
@@ -1183,8 +1229,7 @@ fn process_bucket(
     for l in 0..eoff.len() - 1 {
         let pe = &evs[eoff[l] as usize..eoff[l + 1] as usize];
         let pc = &cks[coff[l] as usize..coff[l + 1] as usize];
-        let key = pe[0].ukey;
-        let name = if key & LINKED != 0 { ctx.person_name[(key & !LINKED) as usize] } else { pe[0].uloc };
+        let name = names[l];
 
         // sessionize + user_daily
         sessions.clear();
@@ -1210,9 +1255,13 @@ fn process_bucket(
                 rows.push(r);
             }
         };
-        for e in pe {
-            if sessions.is_empty() || e.ts - last_ts > GAP_MS {
-                let day = (e.ts.div_euclid(DAY_MS) - ctx.ws_day) as u32;
+        for &pk in pe {
+            let e_ts = ctx.ws + (pk >> 33) as i64;
+            let e_etype = ((pk >> 31) & 3) as u8;
+            let e_price = ((pk >> 7) & 0xff_ffff) as u32;
+            let e_cat = (pk & 127) as u16;
+            if sessions.is_empty() || e_ts - last_ts > GAP_MS {
+                let day = (e_ts.div_euclid(DAY_MS) - ctx.ws_day) as u32;
                 if cur.as_ref().map(|r| r.day != (ctx.ws_day + day as i64) as i32).unwrap_or(true) {
                     flush(&mut cur, &mut cat_rev, &mut touched, rows);
                     cur = Some(UserRow {
@@ -1225,20 +1274,20 @@ fn process_bucket(
                     });
                 }
                 cur.as_mut().unwrap().sessions += 1;
-                sessions.push(Sess { start: e.ts, day, revenue: 0, purch: false });
+                sessions.push(Sess { start: e_ts, day, revenue: 0, purch: false });
             }
-            last_ts = e.ts;
+            last_ts = e_ts;
             let r = cur.as_mut().unwrap();
             r.events += 1;
-            if e.etype == 3 {
+            if e_etype == 3 {
                 let s = sessions.last_mut().unwrap();
-                s.revenue += e.price as u64;
+                s.revenue += e_price as u64;
                 s.purch = true;
-                r.revenue += e.price as u64;
-                if cat_rev[e.cat as usize] == 0 {
-                    touched.push(e.cat);
+                r.revenue += e_price as u64;
+                if cat_rev[e_cat as usize] == 0 {
+                    touched.push(e_cat);
                 }
-                cat_rev[e.cat as usize] += e.price as u64;
+                cat_rev[e_cat as usize] += e_price as u64;
             }
         }
         flush(&mut cur, &mut cat_rev, &mut touched, rows);

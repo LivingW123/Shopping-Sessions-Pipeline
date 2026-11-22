@@ -53,3 +53,18 @@ jobs:
           cat /tmp/s20/events/* > /dev/null
           for i in 1 2 3; do run s20 /tmp/s20; done
           run s20-nc8 /tmp/s20 8
+
+      - name: Profile (native, perf)
+        continue-on-error: true
+        run: |
+          note() { msg=$(awk 'BEGIN{ORS="%0A"} {gsub(/%/,"%25"); print}' "$2"); echo "::notice title=$1::$msg"; }
+          cat /sys/kernel/mm/transparent_hugepage/enabled > /tmp/thp.txt; note thp /tmp/thp.txt
+          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) > /dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure > /dev/null 2>&1 || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+          rm -rf /tmp/o; NCPU=4 DATA_DIR=/tmp/s20 OUTPUT_DIR=/tmp/o PIPE_VERBOSE=1 perf record -F 2000 -g -o /tmp/perf.data target/release/pipeline 2> /tmp/plog.txt || true
+          note native-run /tmp/plog.txt
+          perf report -i /tmp/perf.data --no-children --stdio --sort srcline --percent-limit 0.7 -g none 2>/dev/null | grep -v "^#" | grep -v "^$" | head -60 > /tmp/prof.txt
+          note profile /tmp/prof.txt
+          perf report -i /tmp/perf.data --no-children --stdio --sort sym --percent-limit 0.5 -g none 2>/dev/null | grep -v "^#" | grep -v "^$" | head -40 > /tmp/prof2.txt
+          note profile-sym /tmp/prof2.txt
