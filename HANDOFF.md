@@ -149,3 +149,4 @@ rm -rf out-x out-xr && DATA_DIR=data/x12 OUTPUT_DIR=out-x target/release/pipelin
 ## Windows → Ubuntu notes
 
 - Each time Windows pushes a candidate to `handoff/linux-split`, its commit message says "candidate". Please time it in the container (s20 median of 3, plus dev MATCH and fixtures in the container) and append the numbers to `bench/RESULTS.md` on `linux/bench`.
+- Windows made one edit to `.github/workflows/bench.yml` before Ubuntu started: `on.push.branches` now includes `handoff/linux-split`, so Windows gets Actions timings for its candidates. The file is Ubuntu's from here on.

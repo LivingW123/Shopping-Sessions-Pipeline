@@ -16,23 +16,44 @@ const P2: u64 = 0x8ebc_6af0_9c88_c6e3;
 const P3: u64 = 0x5899_65cc_7537_4cc3;
 
 /// 64-bit hash of a byte string (wyhash-style). Strings are opaque IDs.
+/// Every byte is covered by (overlapping) unaligned loads; no memcpy.
 #[inline]
 pub fn hash64(b: &[u8], seed: u64) -> u64 {
+    #[inline(always)]
+    fn r8(b: &[u8], i: usize) -> u64 {
+        u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
+    }
+    #[inline(always)]
+    fn r4(b: &[u8], i: usize) -> u64 {
+        u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as u64
+    }
     let n = b.len();
     let mut h = seed ^ P0;
-    let mut i = 0;
-    while i + 8 <= n {
-        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        h = mum(w ^ P1, h ^ P2);
-        i += 8;
+    let (a, c);
+    if n <= 16 {
+        if n >= 8 {
+            a = r8(b, 0);
+            c = r8(b, n - 8);
+        } else if n >= 4 {
+            a = r4(b, 0);
+            c = r4(b, n - 4);
+        } else if n > 0 {
+            a = ((b[0] as u64) << 16) | ((b[n >> 1] as u64) << 8) | b[n - 1] as u64;
+            c = 0;
+        } else {
+            a = 0;
+            c = 0;
+        }
+    } else {
+        let mut i = 0;
+        while i + 16 < n {
+            h = mum(r8(b, i) ^ P1, r8(b, i + 8) ^ h);
+            i += 16;
+        }
+        a = r8(b, n - 16);
+        c = r8(b, n - 8);
     }
-    if i < n {
-        let mut t = [0u8; 8];
-        t[..n - i].copy_from_slice(&b[i..]);
-        let w = u64::from_le_bytes(t);
-        h = mum(w ^ P3, h ^ P1);
-    }
-    let r = mum(h ^ P2, (n as u64) ^ P0 ^ seed);
+    let r = mum(mum(a ^ P1, c ^ h ^ P2) ^ P3, (n as u64) ^ P0 ^ seed);
     r | (r == 0) as u64 // never 0: 0 marks empty slots
 }
 
@@ -332,6 +353,25 @@ mod tests {
         assert_eq!(parse_ts(b"2026-10-03T23:58:10+0200"), None);
         assert_eq!(parse_ts(b"1.79e12"), None);
         assert_eq!(parse_ts(b"999999999999999999999"), Some(i64::MAX));
+    }
+    #[test]
+    fn hash_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        let mut n = 0;
+        for len in 0..=48usize {
+            for k in 0..8000u64 {
+                let mut v: Vec<u8> = (0..len).map(|i| b'a' + ((k.wrapping_mul(2654435761) >> (i % 13)) % 26) as u8).collect();
+                if len > 0 {
+                    v[(k as usize) % len] = (k % 251) as u8;
+                }
+                if seen.insert(v.clone()) {
+                    n += 1;
+                    assert!(seen.len() == n);
+                }
+            }
+        }
+        let hs: std::collections::HashSet<u64> = seen.iter().map(|v| hash64(v, 7)).collect();
+        assert_eq!(hs.len(), seen.len());
     }
     #[test]
     fn ts_cache() {

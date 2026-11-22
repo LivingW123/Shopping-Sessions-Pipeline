@@ -2,7 +2,7 @@ name: bench
 
 on:
   push:
-    branches: [main]
+    branches: [main, handoff/linux-split]
   workflow_dispatch:
 
 jobs:
